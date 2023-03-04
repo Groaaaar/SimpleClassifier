@@ -1,0 +1,253 @@
+import numpy
+import numpy as np
+from PIL import Image
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+import os
+import requests
+import pickle
+class pic_features_extractor():
+    def __init__(self):
+        self.transformations = {
+            'base': lambda x: x,
+            'norm': self.normalize_pic,
+            'pix': self.pixelise_pic,
+            'conv': lambda x: self.conv(self.normalize_pic(x)),
+            'crop': self.crop,
+            'cr_n': lambda x: self.crop(self.normalize_pic(x)),
+            'cr_p': lambda x: self.crop(self.pixelise_pic(x)),
+            'cr_c': lambda x: self.crop(self.conv(self.normalize_pic(x))),
+        }
+        self.stats = ['mean', 'std', 'q_col']
+        self.columns = [i + "_" + j for i in self.transformations for j in self.stats]
+    def load_pic(self,*args, size=256):
+        """
+        Load a picture, resize it (size*size) - (256,256) by default, resolve conversion issues,
+        normalize it [0,1]. Takes the path as input and return a numpy array. If the image has a transparency,
+        the transparency will be ignored
+        """
+        pic=None
+        if (len(args)>1):
+            pic = Image.open(os.path.join(*args))
+        elif args[0][:4]=="http":
+            response = requests.get(args[0], stream=True)
+            response.raw.decode_content = True
+            pic = Image.open(response.raw)
+        else:
+            pic = Image.open(args[0])
+        pic = pic.resize((size, size))
+        array = np.array(pic)
+        if array.ndim == 2:
+            array = np.stack([array, array, array], axis=2)
+        if array.shape[2] == 4:
+            array = array[:, :, 0:3]
+        return array / 255.0
+    def normalize_pic(self, pic, dec=1):
+        """
+        normalize the colors to avoid 'dust' effect. Rounds to 'dec' numbers (1 by default).
+        """
+        pic = np.round(pic * 10 ** dec, decimals=0) / 10 ** dec
+        return pic
+    def conv(self,pic):
+        """
+        Apply a home-brew convolution. The function expects pic to be normalized (0,1). It will compute each pixels as the pixels
+        minus the average value of surrounding pixels (pixels above, below, on the right and on the left). In order ot have a mean
+        color at 0.5, each color is computed as:
+        0.5 + pixels - 0.25 x (below+above+right+left)
+
+        """
+        my_array = np.array(pic, dtype=float)
+        my_array = (my_array[1:-1, 1:-1] - 0.25 * (my_array[1:-1, 2:] + my_array[1:-1, :-2] +
+                                                   my_array[2:, 1:-1] + my_array[:-2, 1:-1])) / 2 + 0.5
+        my_array[my_array < 0] = 0
+        return my_array
+    def pixelise_pic(self, pic, pixels=5):
+        """
+        Take each block of pixels (5 by defaut), average its value and inject as a single pixel in the returned image. The
+        size of the returned image is thus the original size // pixels.
+        """
+        dim = np.array(pic.shape)
+        dim = pixels * (dim // pixels)
+        blocked_matrix = np.reshape(pic[0:dim[0], 0:dim[1]],
+                                    (dim[0] // pixels, pixels, dim[1] // pixels, pixels, 3)).mean(axis=(1, 3))
+        return blocked_matrix
+    def crop(self, pic, pixels=5):
+        """
+        Extract a borders of 'pixels' pixels. The returned image is computed by the following algorithm:
+          1 Stack vertically the top and bottom border
+          2.Transpose the right and left borders and stack the outputs vertically
+          3. Stack horizontally 1 and 2
+        The output is a picture of 2x'pixels' pixels high and  (length+height-pixels) wide
+        """
+        hor = np.vstack((pic[:pixels, :, :], pic[-pixels:, :, :]))
+        ver = np.vstack((pic[:, :pixels, :].transpose([1, 0, 2]), pic[:, -pixels:, :].transpose([1, 0, 2])))
+        return np.hstack((hor, ver))
+    def get_colors(self, pic):
+        """
+        Return the different colors in a picture (RGB)
+        """
+        dim = pic.shape
+        return np.unique(np.resize(pic, (dim[0] * dim[1], 3)), axis=0)
+    def get_q_colors(self, pic):
+        """
+        Return the quantity of different colors in a picture
+        """
+        dim = pic.shape
+        return len(np.unique(np.resize(pic, (dim[0] * dim[1], 3)), axis=0))
+    def get_stats(self, pic):
+        """
+        Return a list containing at index
+        - 0: mean value of the pixels of the picture
+        - 1: std deviation of the pixels of the picture
+        - 2: the amount of different colors in the picture
+        """
+        output = []
+        output.append(pic.mean())
+        output.append(pic.std())
+        output.append(self.get_q_colors(pic))
+        return output
+    def get_features(self,pic):
+        """
+        returns a list of the stats (self.stats) of a single picture passed as a numpy array, local file path or URL.
+        The features generated by self.stats applied on the picture modified by the functions described in
+        self.transformation. The corresponding column names can be retrieved in self.columns
+        :param pic: can be either a numpy array (value in [0,1]) or the path to a picture or a URL (starting with http)
+        :return: a list of features. Name of the features are described in self.columns
+        """
+        if type(pic)==str:
+            pic = self.load_pic(pic)
+        row = []
+        for t in self.transformations:
+            row = row + self.get_stats(self.transformations[t](pic))
+        return row
+    def get_training_data(self, path):
+        """
+        Generate features of training data located at path. Infers the name of label from subdirectories.
+        :param path: root folder of the sub-folders containing the image. The folder must contain sub-folders named as
+        the label of the pictures contained in it
+        :return: a tuple containing (labels,X,y,file_names)
+        - labels : a dictionary mapping labels and their numerical value. keys are the numerical values and values
+        the labels (sub-folder) names
+        - X : a 2d numpy array. Each row will represent the feature of each picture obtained by calling the get_features
+        method
+        - y : a 1d numpy array containing the numerical label of the picture. The name of the label can be retried
+        thanks to the returned labels directories
+        - file_names : a list of the files names (full path) corresponding to X and y
+        """
+        labels = dict(zip(range(len(os.listdir(path))),os.listdir(path)))
+        X = []
+        y = []
+        file_names = []
+        for l in labels.values():
+            numeric_label = -1
+            for i in labels.items():
+                if i[1]==l:
+                    numeric_label=i[0]
+            files = os.listdir(os.path.join(path,l))
+            for f in files:
+                y.append(numeric_label)
+                X.append(self.get_features(os.path.join(path,l,f)))
+                file_names.append(os.path.join(path,l,f))
+        return labels, numpy.array(X), numpy.array(y), file_names
+    def get_test_data(self,path):
+        """
+        Generate features test data located at path.
+        :param path: folder the test image. The folder must contain only images
+        :return: a tuple containing (names,X)
+        - X : a 2d numpy array. Each row will represent the feature of each picture obtained by calling the get_features
+        - file_names : a list containing the names of the picture loaded
+        method
+        """
+        X= []
+        file_names = []
+        files = os.listdir(path)
+        for f in files:
+            X.append(self.get_features(os.path.join(path, f)))
+            file_names.append(os.path.join(path, f))
+        return numpy.array(X), file_names
+
+class aps_clf(): # ambiance-product-sketch classifier
+    def __init__(self):
+        steps = [('scaler', StandardScaler()),
+                     ('forest', RandomForestClassifier(max_depth=10))]
+        self.classifier = Pipeline(steps)
+        self.labels = dict()
+    def save(self,name):
+        """
+        Save the current model under the path ./Model/name
+        :param name: name to be given to the model
+        :return: nothing
+        """
+        with open(os.path.join("Model",name),"wb") as f:
+            pickle.dump(self.classifier,f)
+            pickle.dump(self.labels,f)
+    def load(self,name):
+        """
+        Load the model located at ./Model/name
+        :param name: name of the model to be loaded
+        :return: nothing
+        """
+        with open(os.path.join("Model", name), "rb") as f:
+            self.classifier = pickle.load(f)
+            self.labels = pickle.load(f)
+    def train(self,X,y):
+        """
+        Train the classifier with X and y.
+        :param X:
+        :param y:
+        :return: nothing
+        """
+        self.classifier.fit(X,y)
+    def predict(self,X):
+        """
+        Predict the labels associated with X
+        :param X: numpy array containing the sample features. 2d array (multiple samples) or 1d array (single sample)
+        :return: numpy 2d array containing the labels (numeric)
+        """
+        X = np.array(X)
+        if X.ndim==1:
+            X = X.reshape(1,-1)
+        return self.classifier.predict(X)
+
+    def predict_proba(self,X):
+        """
+        Predict the probabilities associated with labels computed for samples features X
+        :param X: numpy array containing the sample features. 2d array (multiple samples) or 1d array (single sample)
+        :return: numpy 2d array containing the labels probabilities
+        """
+        X = np.array(X)
+        if X.ndim==1:
+            X = X.reshape(1,-1)
+        return self.classifier.predict_proba(X)
+    def score(self,X,y):
+        """
+        Compute the accuracy of the classifier on X and y
+        :param X:
+        :param y:
+        :return:
+        """
+        return self.classifier.score(X,y)
+
+if __name__=="__main__":
+    test = pic_features_extractor()
+    # labels,X,y, _ = test.get_training_data("DATA")
+
+    test2 = aps_clf()
+    # test2.labels = labels
+    # test2.train(X,y)
+    # test2.save("Model")
+    test2.load("Model")
+    # print("After loading", test2.score(X,y))
+    print("We have now an ambiance, product and sketch picture")
+    for pic in ["https://www.systemed.fr/images/conseils/tariere-jardin-forer-sans-se-planter-2034-l870-h630.jpg",
+                "https://www.lidl.be/assets/gcp142a0ef37e6543a2a064f64c406558bc.jpeg",
+                "https://i0.wp.com/www.riskology.co/wp-content/uploads/2015/08/schema-learning.jpg"]:
+        test_pic = test.get_features(pic)
+        pred = test2.predict(np.array(test_pic))
+        print(f"Prediction for {pic} is {pred[0]}")
+        print(f"This corresponds to {test2.labels[pred[0]]}")
+
+    # print(np.all(np.argmax(test2.predict_proba(X),axis=1)==y))
+
+
